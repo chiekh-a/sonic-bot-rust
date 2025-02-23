@@ -10,9 +10,7 @@ use chrono::Utc;
 use futures;
 use tokio::sync::mpsc;
 
-const WS_URL: &str = "wss://rpc.soniclabs.com";
-const CHANNEL_BUFFER_SIZE: usize = 1000;
-const MAX_CONCURRENT_RECEIPTS: usize = 100;
+const WS_URL: &str = "wss://rpc.ankr.com/sonic_mainnet/ws/731754ca3f4f0ba8bf96e438ab39ff64dd9633475b5afe3c514d76aaad219784";
 
 async fn create_websocket() -> web3::Result<WebSocket> {
     let ws = WebSocket::new(WS_URL).await?;
@@ -20,35 +18,44 @@ async fn create_websocket() -> web3::Result<WebSocket> {
 }
 
 async fn process_block(web3: &Web3<WebSocket>, header: BlockHeader) -> web3::Result<()> {
-    // Get block number early to minimize latency
+    let current_time = Utc::now().timestamp_millis() as u64;
     let block_number = header.number.unwrap();
-    let now = Utc::now().timestamp_millis() as u64;
     
-    // Start fetching block data immediately
-    let block_future = web3.eth().block_with_txs(BlockId::Number(BlockNumber::Number(block_number)));
+    // Use a bounded channel with a smaller buffer for better backpressure
+    let (tx, mut rx) = mpsc::channel(100);
     
-    // Process the block as soon as we get it
-    if let Ok(Some(block)) = block_future.await {
+    // Spawn the output processor first
+    let process_handle = tokio::spawn(async move {
+        let mut outputs = Vec::with_capacity(32);
+        while let Some((addr, timestamp, now, latency)) = rx.recv().await {
+            outputs.push(format!("CONTRACT|{}|{}|{}|{}", addr, timestamp, now, latency));
+            // Batch print if we have enough outputs or channel is empty
+            if outputs.len() >= 32 || rx.try_recv().is_err() {
+                println!("{}", outputs.join("\n"));
+                outputs.clear();
+            }
+        }
+        // Print any remaining outputs
+        if !outputs.is_empty() {
+            println!("{}", outputs.join("\n"));
+        }
+    });
+
+    // Start fetching block data
+    let block = web3.eth().block_with_txs(BlockId::Number(BlockNumber::Number(block_number))).await?;
+    
+    if let Some(block) = block {
         let block_timestamp_ms = block.timestamp.as_u64() * 1000;
         
-        let (tx, mut rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-        
-        // Spawn a separate task for processing results
-        let process_handle = tokio::spawn(async move {
-            while let Some((addr, timestamp, now, latency)) = rx.recv().await {
-                println!("CONTRACT|{}|{}|{}|{}", addr, timestamp, now, latency);
-            }
-        });
-
-        // Process transactions in parallel with maximum efficiency
+        // Process transactions with increased parallelism
         futures::stream::iter(block.transactions)
             .map(|transaction| {
                 let web3 = web3.clone();
-                let sender = tx.clone();  // renamed from tx_sender to avoid confusion
+                let sender = tx.clone();
                 async move {
-                    if let Ok(Some(receipt)) = web3.eth().transaction_receipt(transaction.hash).await {
+                    let receipt_future = web3.eth().transaction_receipt(transaction.hash);
+                    if let Ok(Some(receipt)) = receipt_future.await {
                         if let Some(contract_addr) = receipt.contract_address {
-                            let current_time = Utc::now().timestamp_millis() as u64;
                             let _ = sender.send((
                                 contract_addr,
                                 block_timestamp_ms,
@@ -59,7 +66,7 @@ async fn process_block(web3: &Web3<WebSocket>, header: BlockHeader) -> web3::Res
                     }
                 }
             })
-            .buffer_unordered(MAX_CONCURRENT_RECEIPTS)
+            .buffer_unordered(200) // Increased concurrent processing
             .collect::<Vec<()>>()
             .await;
 
