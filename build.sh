@@ -1,1 +1,3 @@
-nix-shell -p openssl.dev pkg-config --run "cargo build --release"
+nix-shell -p openssl pkg-config --run "cargo build --release"
+
+
