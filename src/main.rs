@@ -10,6 +10,13 @@ use chrono::Utc;
 use futures;
 use tokio::sync::mpsc;
 
+struct Config {
+    ws_url: String,
+    batch_size: usize,
+    concurrent_requests: usize,
+    receipt_timeout: Duration,
+}
+
 const WS_URL: &str = "wss://rpc.ankr.com/sonic_mainnet/ws/731754ca3f4f0ba8bf96e438ab39ff64dd9633475b5afe3c514d76aaad219784";
 
 async fn create_websocket() -> web3::Result<WebSocket> {
@@ -22,7 +29,7 @@ async fn process_block(web3: &Web3<WebSocket>, header: BlockHeader) -> web3::Res
     let block_number = header.number.unwrap();
     
     // Use a bounded channel with a smaller buffer for better backpressure
-    let (tx, mut rx) = mpsc::channel(100);
+    let (tx, mut rx) = mpsc::channel(256);
     
     // Spawn the output processor first
     let process_handle = tokio::spawn(async move {
